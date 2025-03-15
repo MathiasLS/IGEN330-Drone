@@ -27,6 +27,7 @@ unsigned long calibrationEnd;
 
 int fallCounter = 0;
 bool fallDetected = false;
+String dataLog = "Time,AX,AY,AZ,FallDetected\n";  // Initialize CSV header
 
 void setupWiFi() {
     WiFi.softAP(ssid, password);
@@ -45,12 +46,18 @@ void handleRoot() {
     "h2 { margin: 20px 0; }"
     "canvas { max-width: 100%; max-height: 60vh; margin-bottom: 20px; }"
     ".alert { background-color: red; color: white; padding: 10px; margin-top: 10px; display: none; }"
+    ".button-container { display: flex; justify-content: center; align-items: center; margin-top: 20px; }"
     "button { margin: 10px; padding: 10px; }"
+    "#fallAlert { background-color: white; color: black; border: 1px solid black; }"
+    "#fallAlert.active { background-color: red; color: white; }"
     "</style></head>"
     "<body><h2>Real-Time Acceleration Data</h2><canvas id=\"accelChart\"></canvas>"
-    "<div id=\"fallAlert\" class=\"alert\">Fall Detected</div>"
+    "<div class=\"button-container\">"
     "<button id=\"resetFall\">Fall Reset</button>"
+    "<button id=\"fallAlert\">Fall Detected</button>"
     "<button id=\"deployParachute\">Deploy Parachute</button>"
+    "<button id=\"downloadData\">Download Data</button>"
+    "</div>"
     "<script>"
     "document.addEventListener('DOMContentLoaded', (event) => {"
     "let ws;"
@@ -60,8 +67,8 @@ void handleRoot() {
     "ws.onmessage = function(event) { const data = JSON.parse(event.data);"
     "accelDataX.push(data.ax); accelDataY.push(data.ay); accelDataZ.push(data.az);"
     "labels.push(''); if (accelDataX.length > 300) { accelDataX.shift(); accelDataY.shift(); accelDataZ.shift(); labels.shift(); }"
-    "accelChart.update(); if (data.fall) { document.getElementById('fallAlert').style.display = 'block'; }"
-    "else { document.getElementById('fallAlert').style.display = 'none'; } };"
+    "accelChart.update(); if (data.fall) { document.getElementById('fallAlert').classList.add('active'); }"
+    "else { document.getElementById('fallAlert').classList.remove('active'); } };"
     "ws.onclose = () => { console.log('WebSocket disconnected, attempting to reconnect...'); setTimeout(connectWebSocket, 1000); };"
     "ws.onerror = (error) => { console.log('WebSocket Error: ', error); ws.close(); };"
     "};"
@@ -76,6 +83,7 @@ void handleRoot() {
     "responsive: true, scales: { x: { display: false }, y: { beginAtZero: false, suggestedMin: -10, suggestedMax: 10 }}}});"
     "document.getElementById('resetFall').addEventListener('click', () => { ws.send('resetFall'); });"
     "document.getElementById('deployParachute').addEventListener('click', () => { ws.send('deployParachute'); });"
+    "document.getElementById('downloadData').addEventListener('click', () => { window.location.href = '/downloadData'; });"  // Trigger download
     "});"
     "</script></body></html>";
 
@@ -91,6 +99,10 @@ void handleChartJS() {
     }
     server.streamFile(file, "application/javascript");
     file.close();
+}
+
+void handleDownloadData() {
+    server.send(200, "text/csv", dataLog);
 }
 
 void setup() {
@@ -109,6 +121,7 @@ void setup() {
 
     server.on("/", handleRoot);
     server.on("/chart.js", HTTP_GET, handleChartJS);  // Handle chart.js requests
+    server.on("/downloadData", HTTP_GET, handleDownloadData);  // Handle download data requests
 
     server.begin();
 
@@ -175,6 +188,9 @@ void sendSensorData(unsigned long currentMillis) {
     String jsonString;
     serializeJson(jsonDoc, jsonString);
     webSocket.broadcastTXT(jsonString);
+
+    // Log data
+    dataLog += String(seconds) + "," + String(ax_corrected) + "," + String(ay_corrected) + "," + String(az_corrected) + "," + String(fallDetected) + "\n";
 }
 
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
