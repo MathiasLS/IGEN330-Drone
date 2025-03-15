@@ -1,0 +1,190 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <ArduinoJson.h>
+#include <SPIFFS.h>
+
+const char* ssid = "Parachute_ESP32_Server";
+const char* password = "12345678";
+
+WebServer server(80);
+WebSocketsServer webSocket(81);
+Adafruit_MPU6050 mpu;
+
+unsigned long lastUpdateTime = 0;
+const int updateInterval = 10;
+const int fallThreshold = 5;
+
+bool calibrationDone = false;
+float ax_offset = 0, ay_offset = 0, az_offset = 0;
+int calibrationCount = 0;
+float ax_sum = 0, ay_sum = 0, az_sum = 0;
+unsigned long calibrationStart;
+unsigned long calibrationEnd;
+
+int fallCounter = 0;
+bool fallDetected = false;
+
+void setupWiFi() {
+    WiFi.softAP(ssid, password);
+    Serial.println("Access Point Started");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.softAPIP());
+}
+
+void handleRoot() {
+    String htmlContent = "<!DOCTYPE html><html lang=\"en\"><head>"
+    "<meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+    "<title>MPU6050 Real-Time Graph</title>"
+    "<script src=\"/chart.js\"></script>"  // Load Chart.js from SPIFFS
+    "<style>"
+    "body { font-family: Arial, sans-serif; text-align: center; margin: 0; height: 100vh;"
+    "display: flex; justify-content: center; align-items: center; flex-direction: column; }"
+    "canvas { max-width: 100%; height: 60vh; }"
+    ".alert { background-color: red; color: white; padding: 10px; margin-top: 10px; display: none; }"
+    "button { margin: 10px; padding: 10px; }</style></head>"
+    "<body><h2>Real-Time Acceleration Data</h2><canvas id=\"accelChart\"></canvas>"
+    "<div id=\"fallAlert\" class=\"alert\">Fall Detected</div>"
+    "<button id=\"resetFall\">Fall Reset</button>"
+    "<button id=\"deployParachute\">Deploy Parachute</button>"
+    "<script>"
+    "document.addEventListener('DOMContentLoaded', (event) => {"
+    "const ws = new WebSocket('ws://' + location.hostname + ':81/');"
+    "let labels = Array(200).fill('');"
+    "let accelDataX = Array(200).fill(0), accelDataY = Array(200).fill(0), accelDataZ = Array(200).fill(0);"
+    "const ctx = document.getElementById('accelChart').getContext('2d');"
+    "const accelChart = new Chart(ctx, { type: 'line', data: { labels: labels, datasets: ["
+    "{ label: 'X Acceleration', data: accelDataX, borderColor: 'red', fill: false },"
+    "{ label: 'Y Acceleration', data: accelDataY, borderColor: 'green', fill: false },"
+    "{ label: 'Z Acceleration', data: accelDataZ, borderColor: 'blue', fill: false }] }, options: { animation: false, "
+    "responsive: true, scales: { x: { display: false }, y: { beginAtZero: false, suggestedMin: -10, suggestedMax: 10 }}}});"
+    "ws.onmessage = function(event) { const data = JSON.parse(event.data);"
+    "accelDataX.push(data.ax); accelDataY.push(data.ay); accelDataZ.push(data.az);"
+    "labels.push(''); if (accelDataX.length > 200) { accelDataX.shift(); accelDataY.shift(); accelDataZ.shift(); labels.shift(); }"
+    "accelChart.update(); if (data.fall) { document.getElementById('fallAlert').style.display = 'block'; }"
+    "else { document.getElementById('fallAlert').style.display = 'none'; } };"
+    "ws.onopen = () => console.log('WebSocket connected');"
+    "ws.onerror = (error) => console.log('WebSocket Error: ', error); ws.onclose = () => console.log('WebSocket disconnected');"
+    "document.getElementById('resetFall').addEventListener('click', () => { ws.send('resetFall'); });"
+    "document.getElementById('deployParachute').addEventListener('click', () => { ws.send('deployParachute'); });"
+    "});"
+    "</script></body></html>";
+
+    server.send(200, "text/html", htmlContent);
+}
+
+void handleChartJS() {
+    File file = SPIFFS.open("/chart.js", "r");
+    if (!file) {
+        Serial.println("chart.js file not found!");
+        server.send(404, "text/plain", "chart.js file not found");
+        return;
+    }
+    server.streamFile(file, "application/javascript");
+    file.close();
+}
+
+void setup() {
+    Serial.begin(115200);
+    setupWiFi();
+
+    server.on("/favicon.ico", HTTP_GET, []() {
+    server.send(204);  // No Content response
+    });
+
+    if (!SPIFFS.begin()) {
+        Serial.println("Failed to mount SPIFFS");
+        return;
+    }
+    Serial.println("SPIFFS mounted successfully");
+
+    server.on("/", handleRoot);
+    server.on("/chart.js", HTTP_GET, handleChartJS);  // Handle chart.js requests
+
+    server.begin();
+
+    if (!mpu.begin()) {
+        Serial.println("MPU6050 initialization failed!");
+        while (1);
+    }
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    calibrationStart = millis();
+    calibrationEnd = calibrationStart + 1000;
+
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+}
+
+void loop() {
+    server.handleClient();
+    webSocket.loop();
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastUpdateTime >= updateInterval) {
+        lastUpdateTime = currentMillis;
+        sendSensorData(currentMillis);
+    }
+}
+
+void sendSensorData(unsigned long currentMillis) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    if (currentMillis >= calibrationStart && currentMillis <= calibrationEnd) {
+        ax_sum += a.acceleration.x;
+        ay_sum += a.acceleration.y;
+        az_sum += a.acceleration.z;
+        calibrationCount++;
+    }
+    if (currentMillis > calibrationEnd && !calibrationDone) {
+        ax_offset = ax_sum / calibrationCount;
+        ay_offset = ay_sum / calibrationCount;
+        az_offset = az_sum / calibrationCount;
+        calibrationDone = true;
+        Serial.println("Calibration complete");
+    }
+    float ax_corrected = a.acceleration.x - ax_offset;
+    float ay_corrected = a.acceleration.y - ay_offset;
+    float az_corrected = a.acceleration.z - az_offset;
+
+    // Fall detection logic
+    if (az_corrected < -7.0) {
+        fallCounter++;
+        if (fallCounter >= fallThreshold) {
+            fallDetected = true;
+            Serial.println("Fall Detected");
+        }
+    } else {
+        fallCounter = 0;
+    }
+
+    float seconds = currentMillis / 1000.0;
+    StaticJsonDocument<200> jsonDoc;
+    jsonDoc["time"] = seconds;
+    jsonDoc["ax"] = ax_corrected;
+    jsonDoc["ay"] = ay_corrected;
+    jsonDoc["az"] = az_corrected;
+    jsonDoc["fall"] = fallDetected;
+    String jsonString;
+    serializeJson(jsonDoc, jsonString);
+    webSocket.broadcastTXT(jsonString);
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+    if (type == WStype_CONNECTED) {
+        Serial.println("Client connected.");
+        unsigned long esp32Time = millis();
+        String timeSyncMessage = "{\"timeSync\": " + String(esp32Time) + "}";
+        webSocket.sendTXT(num, timeSyncMessage);
+    } else if (type == WStype_TEXT) {
+        String message = String((char *)payload);
+        if (message == "resetFall") {
+            fallDetected = false;
+            Serial.println("Fall status reset");
+        } else if (message == "deployParachute") {
+            fallDetected = true;
+            Serial.println("Parachute Deployed");
+        }
+    }
+}
