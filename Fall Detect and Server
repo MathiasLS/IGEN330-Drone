@@ -16,7 +16,7 @@ Adafruit_MPU6050 mpu;
 
 unsigned long lastUpdateTime = 0;
 const int updateInterval = 10;
-const int fallThreshold = 3;
+const int fallThreshold = 2;
 
 bool calibrationDone = false;
 float ax_offset = 0, ay_offset = 0, az_offset = 0;
@@ -27,6 +27,7 @@ unsigned long calibrationEnd;
 
 int fallCounter = 0;
 bool fallDetected = false;
+bool parachuteDeployed = false;
 String dataLog = "Time,AX,AY,AZ,FallDetected\n";  // Initialize CSV header
 
 void setupWiFi() {
@@ -145,6 +146,10 @@ void loop() {
         lastUpdateTime = currentMillis;
         sendSensorData(currentMillis);
     }
+    if (fallDetected == true && parachuteDeployed == false){
+      // activate servo
+      parachuteDeployed = true;
+    }
 }
 
 void sendSensorData(unsigned long currentMillis) {
@@ -168,11 +173,13 @@ void sendSensorData(unsigned long currentMillis) {
     float az_corrected = a.acceleration.z - az_offset;
 
     // Fall detection logic
-    if (az_corrected < -7.0) {
+    if (az_corrected < -5.0 && calibrationDone == true && parachuteDeployed == false) {
         fallCounter++;
-        if (fallCounter >= fallThreshold) {
+        if (fallCounter >= fallThreshold && fallDetected = false) {
             fallDetected = true;
             Serial.println("Fall Detected");
+            // activate the servo
+            parachuteDeployed = true;
         }
     } else {
         fallCounter = 0;
@@ -203,9 +210,11 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
         String message = String((char *)payload);
         if (message == "resetFall") {
             fallDetected = false;
+            parachuteDeployed = false;
             Serial.println("Fall status reset");
         } else if (message == "deployParachute") {
             fallDetected = true;
+            parachuteDeployed = false;
             Serial.println("Parachute Deployed");
         }
     }
