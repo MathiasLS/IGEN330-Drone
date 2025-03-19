@@ -1,4 +1,4 @@
-// Ideas: falls 5m/s^2 below 10 point moving average?
+// Ideas: absolute acceleration below value
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -9,7 +9,6 @@
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
 #include <math.h>
-#include <imuFilter.h>
 
 
 const char* ssid = "Parachute_ESP32_Server";
@@ -19,30 +18,16 @@ WebServer server(80);
 WebSocketsServer webSocket(81);
 Adafruit_MPU6050 mpu;
 
-// Quaternion-based sensor fusion object
-imuFilter fusion;
-
-// Fusion parameters
-#define GAIN          0.5   // Fusion gain (0-1). 0 = gyro only, 1 = accel only.
-#define SD_ACCEL      0.2   // Standard deviation of acceleration for filtering.
-
 unsigned long lastUpdateTime = 0;
 const int updateInterval = 10;
-const int fallThreshold = 2;
 
 bool calibrationDone = false;
 float ax_offset = 0, ay_offset = 0, az_offset = 0;
-float gx_offset = 0, gy_offset = 0, gz_offset = 0;
 float ax_sum = 0, ay_sum = 0, az_sum = 0;
-float gx_sum = 0, gy_sum = 0, gz_sum = 0;
 
-float pitch = 0, roll = 0, yaw = 0;
-const float alpha = 0.98; // Complementary filter constant
-
-int fallCounter = 0;
 bool fallDetected = false;
 bool parachuteDeployed = false;
-String dataLog = "Time,AX,AY,AZ,FallDetected\n";  // Initialize CSV header
+String dataLog = "Time,AX,AY,AZ,|A|,FallDetected\n";  // Initialize CSV header
 
 void calibrateSensors();
 void sendSensorData(unsigned long currentMillis);
@@ -83,8 +68,8 @@ void handleRoot() {
     "ws = new WebSocket('ws://' + location.hostname + ':81/');"
     "ws.onopen = () => { console.log('WebSocket connected'); ws.send('keepAlive'); setInterval(() => ws.send('keepAlive'), 30000); };"
     "ws.onmessage = function(event) { const data = JSON.parse(event.data);"
-    "accelDataX.push(data.ax); accelDataY.push(data.ay); accelDataZ.push(data.az);"
-    "labels.push(''); if (accelDataX.length > 300) { accelDataX.shift(); accelDataY.shift(); accelDataZ.shift(); labels.shift(); }"
+    "accelDataX.push(data.ax); accelDataY.push(data.ay); accelDataZ.push(data.az); accelDataA.push(data.aa);"
+    "labels.push(''); if (accelDataX.length > 300) { accelDataX.shift(); accelDataY.shift(); accelDataZ.shift(); accelDataA.shift(); labels.shift(); }"
     "accelChart.update(); if (data.fall) { document.getElementById('fallAlert').classList.add('active'); }"
     "else { document.getElementById('fallAlert').classList.remove('active'); } };"
     "ws.onclose = () => { console.log('WebSocket disconnected, attempting to reconnect...'); setTimeout(connectWebSocket, 1000); };"
@@ -92,12 +77,13 @@ void handleRoot() {
     "};"
     "connectWebSocket();"
     "let labels = Array(300).fill('');"
-    "let accelDataX = Array(300).fill(0), accelDataY = Array(300).fill(0), accelDataZ = Array(300).fill(0);"
+    "let accelDataX = Array(300).fill(0), accelDataY = Array(300).fill(0), accelDataZ = Array(300).fill(0), accelDataA = Array(300).fill(0);"
     "const ctx = document.getElementById('accelChart').getContext('2d');"
     "const accelChart = new Chart(ctx, { type: 'line', data: { labels: labels, datasets: ["
     "{ label: 'X Acceleration', data: accelDataX, borderColor: 'red', fill: false },"
     "{ label: 'Y Acceleration', data: accelDataY, borderColor: 'green', fill: false },"
-    "{ label: 'Z Acceleration', data: accelDataZ, borderColor: 'blue', fill: false }] }, options: { animation: false, "
+    "{ label: 'Z Acceleration', data: accelDataZ, borderColor: 'blue', fill: false },"
+    "{ label: 'Absolute Acceleration', data: accelDataA, borderColor: 'black', fill: false }] }, options: { animation: false, "
     "responsive: true, scales: { x: { display: false }, y: { beginAtZero: false, suggestedMin: -10, suggestedMax: 10 }}}});"
     "document.getElementById('resetFall').addEventListener('click', () => { ws.send('resetFall'); });"
     "document.getElementById('deployParachute').addEventListener('click', () => { ws.send('deployParachute'); });"
@@ -136,7 +122,7 @@ void handleDownloadData() {
     // Recreate the file to keep logging enabled after clearing
     file = SPIFFS.open("/dataLog.csv", "w");
     if (file) {
-        file.print("Time,AX,AY,AZ,FallDetected\n");  // Add CSV header
+        file.print("Time,AX,AY,AZ,|A|,FallDetected\n");  // Add CSV header
         file.close();
     }
 }
@@ -180,7 +166,7 @@ void setup() {
     // Create a new data log file and add headers
     File file = SPIFFS.open("/dataLog.csv", "w");
     if (file) {
-        file.println("Time,AX,AY,AZ,FallDetected");  // Write the header
+        file.println("Time,AX,AY,AZ,|A|,FallDetected");  // Write the header
         file.close();
         Serial.println("New data log initialized with headers.");
     } else {
@@ -196,19 +182,11 @@ void setup() {
         Serial.println("MPU6050 initialization failed!");
         while (1);
     }
+   
     mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);    // Low-pass filter
 
     calibrateSensors();
-
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-
-    float ax_corrected = a.acceleration.x - ax_offset;
-    float ay_corrected = a.acceleration.y - ay_offset;
-    float az_corrected = a.acceleration.z - az_offset;
-
-    fusion.setup(ax_corrected, ay_corrected, az_corrected);
 
     webSocket.begin();
     webSocket.onEvent(webSocketEvent);
@@ -229,8 +207,6 @@ void loop() {
 }
 
 void calibrateSensors() {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
 
     const int calibrationSamples = 100;
 
@@ -241,9 +217,6 @@ void calibrateSensors() {
         ax_sum += a.acceleration.x;
         ay_sum += a.acceleration.y;
         az_sum += a.acceleration.z;
-        gx_sum += g.gyro.x;
-        gy_sum += g.gyro.y;
-        gz_sum += g.gyro.z;
 
         delay(10);
     }
@@ -252,9 +225,6 @@ void calibrateSensors() {
         ax_offset = ax_sum / calibrationSamples;
         ay_offset = ay_sum / calibrationSamples;
         az_offset = az_sum / calibrationSamples;
-        gx_offset = gx_sum / calibrationSamples;
-        gy_offset = gy_sum / calibrationSamples;
-        gz_offset = gz_sum / calibrationSamples;
         calibrationDone = true;
         Serial.println("Calibration complete");
 }
@@ -265,56 +235,20 @@ void sendSensorData(unsigned long currentMillis) {
 
     float ax_corrected = a.acceleration.x - ax_offset;
     float ay_corrected = a.acceleration.y - ay_offset;
-    float az_corrected = a.acceleration.z - az_offset;
-    float gx_corrected = g.gyro.x - gx_offset;
-    float gy_corrected = g.gyro.y - gy_offset;
-    float gz_corrected = g.gyro.z - gz_offset;
+    float az_corrected = -1* (a.acceleration.z - az_offset - 9.81);
 
-    // Update imuFilter with corrected IMU data
-    fusion.update(gx_corrected, gy_corrected, gz_corrected, ax_corrected, ay_corrected, az_corrected, GAIN, SD_ACCEL);
+    float a_absolute = sqrt(ax_corrected*ax_corrected + ay_corrected*ay_corrected + az_corrected*az_corrected);
 
-    // Get quaternion values from imuFilter
-    Quaternion q = fusion.getQuaternion();  // This retrieves the quaternion structure
-
-    // Extract quaternion components
-    float qw = q.w();
-    float qx = q.x();
-    float qy = q.y();
-    float qz = q.z();
-
-    // Rotate acceleration using quaternion math (q * v * q^-1)
-    float t2  = qw * qx;
-    float t3  = qw * qy;
-    float t4  = qw * qz;
-    float t5  = -qx * qx;
-    float t6  = qx * qy;
-    float t7  = qx * qz;
-    float t8  = -qy * qy;
-    float t9  = qy * qz;
-    float t10 = -qz * qz;
-
-    // Apply quaternion transformation to align acceleration with global frame
-    float ax_gravity = 2.0 * ((t8 + t10) * ax_corrected + (t6 - t4) * ay_corrected + (t7 + t3) * az_corrected);
-    float ay_gravity = 2.0 * ((t4 + t6) * ax_corrected + (t5 + t10) * ay_corrected + (t9 - t2) * az_corrected);
-    float az_gravity = 2.0 * ((t7 - t3) * ax_corrected + (t2 + t9) * ay_corrected + (t5 + t8) * az_corrected);  // Remove gravity
-
-    // Now ax_gravity, ay_gravity, and az_gravity are aligned with the global frame
-
-    // Fall detection logic
-    if (az_gravity < -5.0 && parachuteDeployed == false) {
-        fallCounter++;
-        if (fallCounter >= fallThreshold && fallDetected == false) {
-            fallDetected = true;
-            // activate servo
-            Serial.println("Fall Detected and Parachute Deployed");
-            parachuteDeployed = true;
-        }
-    } else {
-        fallCounter = 0;
+    // Fall detection logic using absolute accleration less than 1m/s^2
+    if (a_absolute <= 1 && parachuteDeployed == false) {
+          fallDetected = true;
+          // activate servo
+          Serial.println("Fall Detected and Parachute Deployed");
+          parachuteDeployed = true;
     }
 
     float seconds = currentMillis / 1000.0;
-    String dataEntry = String(seconds) + "," + String(ax_gravity) + "," + String(ay_gravity) + "," + String(az_gravity) + "," + String(fallDetected) + "\n";
+    String dataEntry = String(seconds) + "," + String(ax_corrected) + "," + String(ay_corrected) + "," + String(az_corrected) + "," + String(a_absolute) + "," + String(fallDetected) + "\n";
 
     // Save to SPIFFS
     File file = SPIFFS.open("/dataLog.csv", "a");
@@ -326,9 +260,10 @@ void sendSensorData(unsigned long currentMillis) {
     // WebSocket broadcast
     StaticJsonDocument<200> jsonDoc;
     jsonDoc["time"] = seconds;
-    jsonDoc["ax"] = ax_gravity;
-    jsonDoc["ay"] = ay_gravity;
-    jsonDoc["az"] = az_gravity;
+    jsonDoc["ax"] = ax_corrected;
+    jsonDoc["ay"] = ay_corrected;
+    jsonDoc["az"] = az_corrected;
+    jsonDoc["aa"] = a_absolute;
     jsonDoc["fall"] = fallDetected;
     String jsonString;
     serializeJson(jsonDoc, jsonString);
