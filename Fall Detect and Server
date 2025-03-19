@@ -1,3 +1,5 @@
+// Ideas: falls 5m/s^2 below 10 point moving average?
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
@@ -6,6 +8,9 @@
 #include <Adafruit_Sensor.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
+#include <math.h>
+#include <imuFilter.h>
+
 
 const char* ssid = "Parachute_ESP32_Server";
 const char* password = "12345678";
@@ -14,21 +19,33 @@ WebServer server(80);
 WebSocketsServer webSocket(81);
 Adafruit_MPU6050 mpu;
 
+// Quaternion-based sensor fusion object
+imuFilter fusion;
+
+// Fusion parameters
+#define GAIN          0.5   // Fusion gain (0-1). 0 = gyro only, 1 = accel only.
+#define SD_ACCEL      0.2   // Standard deviation of acceleration for filtering.
+
 unsigned long lastUpdateTime = 0;
 const int updateInterval = 10;
 const int fallThreshold = 2;
 
 bool calibrationDone = false;
 float ax_offset = 0, ay_offset = 0, az_offset = 0;
-int calibrationCount = 0;
+float gx_offset = 0, gy_offset = 0, gz_offset = 0;
 float ax_sum = 0, ay_sum = 0, az_sum = 0;
-unsigned long calibrationStart;
-unsigned long calibrationEnd;
+float gx_sum = 0, gy_sum = 0, gz_sum = 0;
+
+float pitch = 0, roll = 0, yaw = 0;
+const float alpha = 0.98; // Complementary filter constant
 
 int fallCounter = 0;
 bool fallDetected = false;
 bool parachuteDeployed = false;
 String dataLog = "Time,AX,AY,AZ,FallDetected\n";  // Initialize CSV header
+
+void calibrateSensors();
+void sendSensorData(unsigned long currentMillis);
 
 void setupWiFi() {
     WiFi.softAP(ssid, password);
@@ -103,27 +120,76 @@ void handleChartJS() {
 }
 
 void handleDownloadData() {
-    server.send(200, "text/csv", dataLog);
+    File file = SPIFFS.open("/dataLog.csv", "r");
+    if (!file) {
+        server.send(404, "text/plain", "No data file found");
+        return;
+    }
+
+    // Stream file to client
+    server.streamFile(file, "text/csv");
+    file.close();
+
+    // Delete the file after serving it
+    SPIFFS.remove("/dataLog.csv");
+
+    // Recreate the file to keep logging enabled after clearing
+    file = SPIFFS.open("/dataLog.csv", "w");
+    if (file) {
+        file.print("Time,AX,AY,AZ,FallDetected\n");  // Add CSV header
+        file.close();
+    }
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+    if (type == WStype_CONNECTED) {
+        Serial.println("Client connected.");
+        unsigned long esp32Time = millis();
+        String timeSyncMessage = "{\"timeSync\": " + String(esp32Time) + "}";
+        webSocket.sendTXT(num, timeSyncMessage);
+    } else if (type == WStype_TEXT) {
+        String message = String((char *)payload);
+        if (message == "resetFall") {
+            fallDetected = false;
+            parachuteDeployed = false;
+            Serial.println("Fall Status Reset");
+        } else if (message == "deployParachute") {
+            fallDetected = true;
+            parachuteDeployed = false;
+            Serial.println("Parachute Deployed Manually");
+        }
+    }
 }
 
 void setup() {
     Serial.begin(115200);
     setupWiFi();
 
-    server.on("/favicon.ico", HTTP_GET, []() {
-    server.send(204);  // No Content response
-    });
-
-    if (!SPIFFS.begin()) {
+    if (!SPIFFS.begin(true)) {
         Serial.println("Failed to mount SPIFFS");
         return;
     }
     Serial.println("SPIFFS mounted successfully");
 
-    server.on("/", handleRoot);
-    server.on("/chart.js", HTTP_GET, handleChartJS);  // Handle chart.js requests
-    server.on("/downloadData", HTTP_GET, handleDownloadData);  // Handle download data requests
+    // Delete the previous log file at startup
+    if (SPIFFS.exists("/dataLog.csv")) {
+        SPIFFS.remove("/dataLog.csv");
+        Serial.println("Old data log deleted.");
+    }
 
+    // Create a new data log file and add headers
+    File file = SPIFFS.open("/dataLog.csv", "w");
+    if (file) {
+        file.println("Time,AX,AY,AZ,FallDetected");  // Write the header
+        file.close();
+        Serial.println("New data log initialized with headers.");
+    } else {
+        Serial.println("Failed to create new data log.");
+    }
+
+    server.on("/", handleRoot);
+    server.on("/chart.js", HTTP_GET, handleChartJS);
+    server.on("/downloadData", HTTP_GET, handleDownloadData);
     server.begin();
 
     if (!mpu.begin()) {
@@ -131,8 +197,18 @@ void setup() {
         while (1);
     }
     mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    calibrationStart = millis();
-    calibrationEnd = calibrationStart + 1000;
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);    // Low-pass filter
+
+    calibrateSensors();
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    float ax_corrected = a.acceleration.x - ax_offset;
+    float ay_corrected = a.acceleration.y - ay_offset;
+    float az_corrected = a.acceleration.z - az_offset;
+
+    fusion.setup(ax_corrected, ay_corrected, az_corrected);
 
     webSocket.begin();
     webSocket.onEvent(webSocketEvent);
@@ -152,33 +228,85 @@ void loop() {
     }
 }
 
-void sendSensorData(unsigned long currentMillis) {
+void calibrateSensors() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
-    if (currentMillis >= calibrationStart && currentMillis <= calibrationEnd) {
+
+    const int calibrationSamples = 100;
+
+    for (int i = 0; i < calibrationSamples; i++) {
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
+      
         ax_sum += a.acceleration.x;
         ay_sum += a.acceleration.y;
         az_sum += a.acceleration.z;
-        calibrationCount++;
+        gx_sum += g.gyro.x;
+        gy_sum += g.gyro.y;
+        gz_sum += g.gyro.z;
+
+        delay(10);
     }
-    if (currentMillis > calibrationEnd && !calibrationDone) {
-        ax_offset = ax_sum / calibrationCount;
-        ay_offset = ay_sum / calibrationCount;
-        az_offset = az_sum / calibrationCount;
+
+   // Compute averages
+        ax_offset = ax_sum / calibrationSamples;
+        ay_offset = ay_sum / calibrationSamples;
+        az_offset = az_sum / calibrationSamples;
+        gx_offset = gx_sum / calibrationSamples;
+        gy_offset = gy_sum / calibrationSamples;
+        gz_offset = gz_sum / calibrationSamples;
         calibrationDone = true;
         Serial.println("Calibration complete");
-    }
+}
+
+void sendSensorData(unsigned long currentMillis) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
     float ax_corrected = a.acceleration.x - ax_offset;
     float ay_corrected = a.acceleration.y - ay_offset;
     float az_corrected = a.acceleration.z - az_offset;
+    float gx_corrected = g.gyro.x - gx_offset;
+    float gy_corrected = g.gyro.y - gy_offset;
+    float gz_corrected = g.gyro.z - gz_offset;
+
+    // Update imuFilter with corrected IMU data
+    fusion.update(gx_corrected, gy_corrected, gz_corrected, ax_corrected, ay_corrected, az_corrected, GAIN, SD_ACCEL);
+
+    // Get quaternion values from imuFilter
+    Quaternion q = fusion.getQuaternion();  // This retrieves the quaternion structure
+
+    // Extract quaternion components
+    float qw = q.w();
+    float qx = q.x();
+    float qy = q.y();
+    float qz = q.z();
+
+    // Rotate acceleration using quaternion math (q * v * q^-1)
+    float t2  = qw * qx;
+    float t3  = qw * qy;
+    float t4  = qw * qz;
+    float t5  = -qx * qx;
+    float t6  = qx * qy;
+    float t7  = qx * qz;
+    float t8  = -qy * qy;
+    float t9  = qy * qz;
+    float t10 = -qz * qz;
+
+    // Apply quaternion transformation to align acceleration with global frame
+    float ax_gravity = 2.0 * ((t8 + t10) * ax_corrected + (t6 - t4) * ay_corrected + (t7 + t3) * az_corrected);
+    float ay_gravity = 2.0 * ((t4 + t6) * ax_corrected + (t5 + t10) * ay_corrected + (t9 - t2) * az_corrected);
+    float az_gravity = 2.0 * ((t7 - t3) * ax_corrected + (t2 + t9) * ay_corrected + (t5 + t8) * az_corrected);  // Remove gravity
+
+    // Now ax_gravity, ay_gravity, and az_gravity are aligned with the global frame
 
     // Fall detection logic
-    if (az_corrected < -5.0 && calibrationDone == true && parachuteDeployed == false) {
+    if (az_gravity < -5.0 && parachuteDeployed == false) {
         fallCounter++;
-        if (fallCounter >= fallThreshold && fallDetected = false) {
+        if (fallCounter >= fallThreshold && fallDetected == false) {
             fallDetected = true;
-            Serial.println("Fall Detected");
-            // activate the servo
+            // activate servo
+            Serial.println("Fall Detected and Parachute Deployed");
             parachuteDeployed = true;
         }
     } else {
@@ -186,36 +314,23 @@ void sendSensorData(unsigned long currentMillis) {
     }
 
     float seconds = currentMillis / 1000.0;
+    String dataEntry = String(seconds) + "," + String(ax_gravity) + "," + String(ay_gravity) + "," + String(az_gravity) + "," + String(fallDetected) + "\n";
+
+    // Save to SPIFFS
+    File file = SPIFFS.open("/dataLog.csv", "a");
+    if (file) {
+        file.print(dataEntry);
+        file.close();
+    }
+
+    // WebSocket broadcast
     StaticJsonDocument<200> jsonDoc;
     jsonDoc["time"] = seconds;
-    jsonDoc["ax"] = ax_corrected;
-    jsonDoc["ay"] = ay_corrected;
-    jsonDoc["az"] = az_corrected;
+    jsonDoc["ax"] = ax_gravity;
+    jsonDoc["ay"] = ay_gravity;
+    jsonDoc["az"] = az_gravity;
     jsonDoc["fall"] = fallDetected;
     String jsonString;
     serializeJson(jsonDoc, jsonString);
     webSocket.broadcastTXT(jsonString);
-
-    // Log data
-    dataLog += String(seconds) + "," + String(ax_corrected) + "," + String(ay_corrected) + "," + String(az_corrected) + "," + String(fallDetected) + "\n";
-}
-
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
-    if (type == WStype_CONNECTED) {
-        Serial.println("Client connected.");
-        unsigned long esp32Time = millis();
-        String timeSyncMessage = "{\"timeSync\": " + String(esp32Time) + "}";
-        webSocket.sendTXT(num, timeSyncMessage);
-    } else if (type == WStype_TEXT) {
-        String message = String((char *)payload);
-        if (message == "resetFall") {
-            fallDetected = false;
-            parachuteDeployed = false;
-            Serial.println("Fall status reset");
-        } else if (message == "deployParachute") {
-            fallDetected = true;
-            parachuteDeployed = false;
-            Serial.println("Parachute Deployed");
-        }
-    }
 }
