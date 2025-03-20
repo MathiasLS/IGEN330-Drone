@@ -1,4 +1,4 @@
-// Ideas: absolute acceleration below value
+// Ideas: absolute acceleration below value of 1
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -9,10 +9,14 @@
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
 #include <math.h>
+#include <ESP32Servo.h>
 
 
 const char* ssid = "Parachute_ESP32_Server";
 const char* password = "12345678";
+
+Servo myServo;  // Create servo object
+int servoPin = 18;  // PWM-capable pin
 
 WebServer server(80);
 WebSocketsServer webSocket(81);
@@ -190,6 +194,9 @@ void setup() {
 
     webSocket.begin();
     webSocket.onEvent(webSocketEvent);
+
+    myServo.attach(servoPin); // Attach servo to the pin
+    myServo.write(0);    // Move to 0°
 }
 
 void loop() {
@@ -201,7 +208,7 @@ void loop() {
         sendSensorData(currentMillis);
     }
     if (fallDetected == true && parachuteDeployed == false){
-      // activate servo
+      myServo.write(90);   // Move to 90°
       parachuteDeployed = true;
     }
 }
@@ -242,7 +249,7 @@ void sendSensorData(unsigned long currentMillis) {
     // Fall detection logic using absolute accleration less than 1m/s^2
     if (a_absolute <= 1 && parachuteDeployed == false) {
           fallDetected = true;
-          // activate servo
+          myServo.write(90);   // Move to 90°
           Serial.println("Fall Detected and Parachute Deployed");
           parachuteDeployed = true;
     }
